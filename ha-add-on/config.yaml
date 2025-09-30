@@ -1,0 +1,23 @@
+name: "Shairport Sync"
+version: "1.0"
+slug: "shairport_sync"
+description: "AirPlay audio receiver using Shairport Sync (custom config)"
+arch:
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+hassio_api: false
+hassio_role: default
+
+host_network: true
+options:
+  conf-url: "http://your-config-url.com/shairport-sync.conf"
+
+schema:
+  conf-url: url
+
+privileged:
+  - SYS_NICE
+audio: true
+init: false
