@@ -151,6 +151,7 @@ char *alsa_mix_dev = NULL;
 char *alsa_mix_ctrl = NULL;
 int alsa_mix_index = 0;
 int has_softvol = 0;
+int linear_fallback = 0;                // No dB anywhere? Map dB→linear raw
 
 int64_t dither_random_number_store = 0;
 
@@ -1000,6 +1001,22 @@ static int prepare_mixer() {
           warn("The hardware mixer specified -- \"%s\" -- does not have "
                "a dB volume scale, and so can not be used by Shairport Sync.",
                alsa_mix_ctrl);
+          linear_fallback = 1;
+          // Ensure linear min/max read earlier are valid; read if needed
+          if (snd_mixer_selem_get_playback_volume_range(alsa_mix_elem, &alsa_mix_minv, &alsa_mix_maxv) < 0)
+            debug(1, "Can't read mixer's [linear] min and max volumes.");
+          // Derive dB range for fallback directly from config
+          long cfg_max_cdB = 0;
+          if (config.volume_max_db_set)
+            cfg_max_cdB = (long)lrint(config.volume_max_db * 100.0);
+          long range_cdB = (config.volume_range_db > 0.0) ? (long)lrint(config.volume_range_db * 100.0) : 0;
+          alsa_mix_maxdb = cfg_max_cdB;
+          alsa_mix_mindb = alsa_mix_maxdb - range_cdB;
+          if (alsa_mix_mindb > alsa_mix_maxdb) alsa_mix_mindb = alsa_mix_maxdb;
+          audio_alsa.volume = &volume;
+          audio_alsa.parameters = &parameters;
+          warn("No hardware dB info; falling back to linear volume mapping (%ld..%ld) with configured dB %0.2f..%0.2f",
+               alsa_mix_minv, alsa_mix_maxv, (1.0 * alsa_mix_mindb)/100.0, (1.0 * alsa_mix_maxdb)/100.0);
           /*
           if ((response = snd_ctl_open(&ctl, alsa_mix_dev, 0)) < 0) {
             warn("Cannot open control \"%s\"", alsa_mix_dev);
@@ -2041,6 +2058,18 @@ static void do_volume(double vol) { // caller is assumed to have the alsa_mutex 
         if (snd_ctl_elem_write(ctl, value) < 0)
           debug(1, "Failed to set playback dB volume for the software volume "
                    "control.");
+      }
+    } else if (linear_fallback) {
+      double db = vol / 100.0; // incoming centi-dB → dB
+      double mindb = (double)alsa_mix_mindb / 100.0;
+      double maxdb = (double)alsa_mix_maxdb / 100.0; // typically 0.0
+      if (db < mindb) db = mindb;
+      if (db > maxdb) db = maxdb;
+      double gain = pow(10.0, db / 60.0);
+      long raw = (long)((alsa_mix_maxv - alsa_mix_minv) * gain + 0.5);
+      debug(1, "request db = %.2fdb, raw = %ld",vol/100.0, raw);
+      if (snd_mixer_selem_set_playback_volume_all(alsa_mix_elem, raw) != 0){
+        debug(1, "Failed to set playback volume (linear fallback amplitude law).");
       }
     } else {
       if (volume_based_mute_is_active == 0) {
