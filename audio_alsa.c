@@ -997,51 +997,45 @@ static int prepare_mixer() {
           debug(3, "Hardware mixer has dB volume from %f to %f.", (1.0 * alsa_mix_mindb) / 100.0,
                 (1.0 * alsa_mix_maxdb) / 100.0);
         } else {
-          // use the linear scale and do the db conversion ourselves
-          warn("The hardware mixer specified -- \"%s\" -- does not have "
-               "a dB volume scale, and so can not be used by Shairport Sync.",
-               alsa_mix_ctrl);
-          linear_fallback = 1;
-          // Ensure linear min/max read earlier are valid; read if needed
-          if (snd_mixer_selem_get_playback_volume_range(alsa_mix_elem, &alsa_mix_minv, &alsa_mix_maxv) < 0)
-            debug(1, "Can't read mixer's [linear] min and max volumes.");
-          // Derive dB range for fallback directly from config
-          long cfg_max_cdB = 0;
-          if (config.volume_max_db_set)
-            cfg_max_cdB = (long)lrint(config.volume_max_db * 100.0);
-          long range_cdB = (config.volume_range_db > 0.0) ? (long)lrint(config.volume_range_db * 100.0) : 0;
-          alsa_mix_maxdb = cfg_max_cdB;
-          alsa_mix_mindb = alsa_mix_maxdb - range_cdB;
-          if (alsa_mix_mindb > alsa_mix_maxdb) alsa_mix_mindb = alsa_mix_maxdb;
-          audio_alsa.volume = &volume;
-          audio_alsa.parameters = &parameters;
-          warn("No hardware dB info; falling back to linear volume mapping (%ld..%ld) with configured dB %0.2f..%0.2f",
-               alsa_mix_minv, alsa_mix_maxv, (1.0 * alsa_mix_mindb)/100.0, (1.0 * alsa_mix_maxdb)/100.0);
-          /*
+          // Try to use ALSA control TLV dB info first
           if ((response = snd_ctl_open(&ctl, alsa_mix_dev, 0)) < 0) {
             warn("Cannot open control \"%s\"", alsa_mix_dev);
-          }
-          if ((response = snd_ctl_elem_id_malloc(&elem_id)) < 0) {
+          } else if ((response = snd_ctl_elem_id_malloc(&elem_id)) < 0) {
             debug(1, "Cannot allocate memory for control \"%s\"", alsa_mix_dev);
             elem_id = NULL;
           } else {
             snd_ctl_elem_id_set_interface(elem_id, SND_CTL_ELEM_IFACE_MIXER);
             snd_ctl_elem_id_set_name(elem_id, alsa_mix_ctrl);
+            snd_ctl_elem_id_set_index(elem_id, alsa_mix_index);
 
             if (snd_ctl_get_dB_range(ctl, elem_id, &alsa_mix_mindb, &alsa_mix_maxdb) == 0) {
               debug(1,
-                    "alsa: hardware mixer \"%s\" selected, with dB volume "
-                    "from %f to %f.",
+                    "alsa: using TLV dB for mixer '%s': %0.2f..%0.2f dB",
                     alsa_mix_ctrl, (1.0 * alsa_mix_mindb) / 100.0, (1.0 * alsa_mix_maxdb) / 100.0);
-              has_softvol = 1;
-              audio_alsa.volume = &volume;         // insert the volume function now
-                                                   // we know it can do dB stuff
-              audio_alsa.parameters = &parameters; // likewise the parameters stuff
+              has_softvol = 1; // dB↔raw conversion via ctl/elem TLV
+              audio_alsa.volume = &volume;
+              audio_alsa.parameters = &parameters;
             } else {
-              debug(1, "Cannot get a dB range from the volume control \"%s\"", alsa_mix_ctrl);
+              // No TLV dB either: fall back to linear mapping
+              linear_fallback = 1;
+              // Ensure linear min/max read earlier are valid; read if needed
+              if (snd_mixer_selem_get_playback_volume_range(alsa_mix_elem, &alsa_mix_minv, &alsa_mix_maxv) < 0)
+                debug(1, "Can't read mixer's [linear] min and max volumes.");
+              // Derive dB range for fallback directly from config
+              long cfg_max_cdB = 0;
+              if (config.volume_max_db_set)
+                cfg_max_cdB = (long)lrint(config.volume_max_db * 100.0);
+              long range_cdB = (config.volume_range_db > 0.0) ? (long)lrint(config.volume_range_db * 100.0) : 0;
+              alsa_mix_maxdb = cfg_max_cdB;
+              alsa_mix_mindb = alsa_mix_maxdb - range_cdB;
+              if (alsa_mix_mindb > alsa_mix_maxdb) alsa_mix_mindb = alsa_mix_maxdb;
+              audio_alsa.volume = &volume;
+              audio_alsa.parameters = &parameters;
+              warn("No hardware dB info; falling back to linear volume mapping (%ld..%ld) with configured dB %0.2f..%0.2f",
+                   alsa_mix_minv, alsa_mix_maxv, (1.0 * alsa_mix_mindb)/100.0, (1.0 * alsa_mix_maxdb)/100.0);
+              
             }
           }
-          */
         }
       }
       if (((config.alsa_use_hardware_mute == 1) &&
@@ -2043,6 +2037,7 @@ static void do_volume(double vol) { // caller is assumed to have the alsa_mutex 
   pthread_cleanup_debug_mutex_lock(&alsa_mixer_mutex, 1000, 1);
   if (volume_set_request && (open_mixer() == 0)) {
     if (has_softvol) {
+          debug(2, "alsa: volume path=TLV dB; request=%.2f dB (centi=%ld)", vol/100.0, (long)vol);
       if (ctl && elem_id) {
         snd_ctl_elem_value_t *value;
         long raw;
@@ -2058,6 +2053,11 @@ static void do_volume(double vol) { // caller is assumed to have the alsa_mutex 
         if (snd_ctl_elem_write(ctl, value) < 0)
           debug(1, "Failed to set playback dB volume for the software volume "
                    "control.");
+        else {
+          long minv = alsa_mix_minv; long maxv = alsa_mix_maxv;
+          double pct = (maxv!=minv)?(100.0*((double)(raw - minv))/((double)(maxv - minv))):0.0;
+          debug(2, "alsa: TLV set raw=%ld within [%ld..%ld] => %.1f%%", raw, minv, maxv, pct);
+        }
       }
     } else if (linear_fallback) {
       double db = vol / 100.0; // incoming centi-dB → dB
